@@ -729,11 +729,12 @@ def build_full_html() -> str:
   let saveTimer = null;
 
   function send(action, payload) {{
-    window.parent.postMessage(
-      {{ type: 'streamlit:setComponentValue',
-         value: {{ action, payload: payload || null }} }},
-      '*'
-    );
+    const msg = {{
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: {{ action: action, payload: payload || null }}
+    }};
+    window.parent.postMessage(msg, "*");
   }}
 
   function autoSave(which) {{
@@ -754,6 +755,18 @@ def build_full_html() -> str:
   if (window.self !== window.top) {{
     window.scrollTo(0, 0);
   }}
+
+  // notify Streamlit iframe is ready
+  window.parent.postMessage(
+    {{ isStreamlitMessage: true, type: "streamlit:componentReady" }},
+    "*"
+  );
+
+  // set iframe height
+  window.parent.postMessage(
+    {{ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: document.body.scrollHeight }},
+    "*"
+  );
 </script>
 </body>
 </html>"""
@@ -765,77 +778,85 @@ def build_full_html() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Compute approximate height (enough for all content)
-PANEL_HEIGHT = 3600
 
-result = components.html(
-    build_full_html(),
-    height=PANEL_HEIGHT,
-    scrolling=True,
-)
+def main():
+  PANEL_HEIGHT = 3600
 
-# ── Handle postMessage events ────────────────────────────────────────────────
-if result is not None:
-    action  = result.get("action", "")
-    payload = result.get("payload")
+  result = components.html(
+      build_full_html(),
+      height=PANEL_HEIGHT,
+      scrolling=True,
+  )
 
-    if action == "lang":
-        st.session_state.lang = "en" if st.session_state.lang == "zh" else "zh"
-        st.rerun()
+  # ── Handle postMessage events ────────────────────────────────────────────────
+  action = ""
+  payload = None
 
-    elif action == "save_naive":
-        if payload is not None and payload != st.session_state.naive_text:
-            st.session_state.naive_text = str(payload)
-            # Don't rerun on every keystroke — let debounce batch it.
-            # Only rerun when a constraint keyword crosses a threshold:
-            new_check = run_check(st.session_state.naive_text)
-            if st.session_state.get("_naive_score") != new_check["score"]:
-                st.session_state["_naive_score"] = new_check["score"]
-                st.rerun()
+  if isinstance(result, dict):
+      action = result.get("action", "")
+      payload = result.get("payload")
 
-    elif action == "save_guided":
-        if payload is not None and payload != st.session_state.guided_text:
-            st.session_state.guided_text = str(payload)
-            new_check = run_check(st.session_state.guided_text)
-            if st.session_state.get("_guided_score") != new_check["score"]:
-                st.session_state["_guided_score"] = new_check["score"]
-                st.rerun()
+      if action == "lang":
+          st.session_state.lang = "en" if st.session_state.lang == "zh" else "zh"
+          st.rerun()
 
-    elif action == "run":
-        st.session_state.show_comparison = True
-        st.rerun()
+      elif action == "save_naive":
+          if payload is not None and payload != st.session_state.naive_text:
+              st.session_state.naive_text = str(payload)
+              # Don't rerun on every keystroke — let debounce batch it.
+              # Only rerun when a constraint keyword crosses a threshold:
+              new_check = run_check(st.session_state.naive_text)
+              if st.session_state.get("_naive_score") != new_check["score"]:
+                  st.session_state["_naive_score"] = new_check["score"]
+                  st.rerun()
 
-    elif action == "reset":
-        for k in ["naive_text","guided_text","show_comparison",
-                  "_naive_score","_guided_score"]:
-            st.session_state.pop(k, None)
-        st.session_state.show_comparison = False
-        st.rerun()
+      elif action == "save_guided":
+          if payload is not None and payload != st.session_state.guided_text:
+              st.session_state.guided_text = str(payload)
+              new_check = run_check(st.session_state.guided_text)
+              if st.session_state.get("_guided_score") != new_check["score"]:
+                  st.session_state["_guided_score"] = new_check["score"]
+                  st.rerun()
 
-    elif action == "dl_xlsx":
-        # File downloads can't happen from inside an iframe — show a native
-        # Streamlit download button at the very bottom of the page instead.
-        st.session_state["_pending_dl"] = "xlsx"
-        st.rerun()
+      elif action == "run":
+          st.session_state.show_comparison = True
+          st.rerun()
 
-    elif action == "dl_pdf":
-        st.session_state["_pending_dl"] = "pdf"
-        st.rerun()
+      elif action == "reset":
+          for k in ["naive_text","guided_text","show_comparison",
+                    "_naive_score","_guided_score"]:
+              st.session_state.pop(k, None)
+          st.session_state.show_comparison = False
+          st.rerun()
 
-# ── Fallback download buttons (rendered outside iframe so they work) ─────────
-pending = st.session_state.pop("_pending_dl", None)
-if pending == "xlsx":
-    st.download_button(
-        "⬇ Click to download Class_List.xlsx",
-        data=gen_xlsx(),
-        file_name="Class_List.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="_dl_xlsx_btn",
-    )
-elif pending == "pdf":
-    st.download_button(
-        "⬇ Click to download Constraint_Ledger.pdf",
-        data=gen_pdf(),
-        file_name="Constraint_Ledger.pdf",
-        mime="application/pdf",
-        key="_dl_pdf_btn",
-    )
+      elif action == "dl_xlsx":
+          # File downloads can't happen from inside an iframe — show a native
+          # Streamlit download button at the very bottom of the page instead.
+          st.session_state["_pending_dl"] = "xlsx"
+          st.rerun()
+
+      elif action == "dl_pdf":
+          st.session_state["_pending_dl"] = "pdf"
+          st.rerun()
+
+  # ── Fallback download buttons (rendered outside iframe so they work) ─────────
+  pending = st.session_state.pop("_pending_dl", None)
+  if pending == "xlsx":
+      st.download_button(
+          "⬇ Click to download Class_List.xlsx",
+          data=gen_xlsx(),
+          file_name="Class_List.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          key="_dl_xlsx_btn",
+      )
+  elif pending == "pdf":
+      st.download_button(
+          "⬇ Click to download Constraint_Ledger.pdf",
+          data=gen_pdf(),
+          file_name="Constraint_Ledger.pdf",
+          mime="application/pdf",
+          key="_dl_pdf_btn",
+      )
+
+if __name__ == "__main__":
+    main()
