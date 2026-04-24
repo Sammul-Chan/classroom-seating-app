@@ -1,862 +1,1101 @@
 """
-AI-Powered Classroom Management — Seating Plan Workshop
-雙語版 · Bilingual Edition (繁體中文 / English)
-
-ARCHITECTURE NOTE — Why this app uses st.components.v1.html() everywhere:
-══════════════════════════════════════════════════════════════════════════════
-When Streamlit is served through localtunnel (or any path-rewriting proxy),
-every lazy-loaded React chunk fails with:
-  TypeError: Failed to fetch dynamically imported module: .../[Name].[hash].js
-
-Affected components include: st.metric, st.download_button, st.text_area,
-st.dataframe, st.columns, st.markdown(unsafe_allow_html=True), st.expander.
-
-The only proxy-safe Streamlit primitive is st.components.v1.html() — it
-renders a sandboxed <iframe> with all HTML/CSS/JS inlined, requiring zero
-dynamic imports from the host origin.
-
-This app therefore renders the ENTIRE UI as one self-contained HTML document
-inside a single components.v1.html() call, using:
-  - postMessage() to send textarea / button events back to Python
-  - st.query_params  as the state bridge (supported in Streamlit ≥ 1.30)
-  - st.rerun()       to redraw when state changes
-══════════════════════════════════════════════════════════════════════════════
+Workshop Prototype v2.1 — AI Classroom Management Workshop
+Senior Python / Streamlit implementation.
+Native Streamlit only — no st.components.v1.html() as primary UI.
 """
 
 import io
 import json
-import random
-import re
+import datetime
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-# ── Page config (only sets browser tab title/icon — no lazy JS needed) ────────
+# ──────────────────────────────────────────────
+# 0. PAGE CONFIG  (must be first Streamlit call)
+# ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI 課室管理 · Classroom Management Workshop",
-    page_icon="🏫",
     layout="wide",
-    initial_sidebar_state="collapsed",   # sidebar disabled; we render our own
+    page_title="AI Seating Workshop",
+    page_icon="🏫",
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. BILINGUAL STRINGS
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# 1. CSS INJECTION  (once, after set_page_config)
+# ──────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    /* Compact top header */
+    .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
 
-ZH = {
-    "page_title":    "AI 課室管理工作坊",
-    "page_subtitle": "工作坊模組 · 座位表設計 — 比較普通與工程化 AI 提示的差異",
-    "lang_btn":      "🌐 Switch to English",
-    # sidebar
-    "res_hub":       "📦 資源中心",
-    "res_sub":       "開始工作坊前請先下載以下檔案",
-    "cl_title":      "📋 學生名單",
-    "cl_desc":       "30 名學生 · 姓名、性別、學術層級、特殊需要",
-    "cl_btn":        "⬇ 下載 Class_List.xlsx",
-    "pdf_title":     "📄 限制條件表",
-    "pdf_desc":      "特殊教育需要規則 · 混合能力 · 課室佈局 · 行為備注",
-    "pdf_btn":       "⬇ 下載 Constraint_Ledger.pdf",
-    "prompt_ref":    "💡 提示語參考",
-    "s1_prompt_lbl": "第一階段 · 普通提示",
-    "s2_prompt_lbl": "第二階段 · 引導提示",
-    "goals_title":   "🎯 工作坊目標",
-    "goals":         ["了解提示工程的質量差異", "練習有限制條件意識的 AI 提示", "根據專業標準評估 AI 輸出"],
-    # metrics
-    "m_students":    "學生人數",
-    "m_constraints": "限制條件數量",
-    "m_stages":      "階段數量",
-    # how it works
-    "how_title":     "本工作坊的流程：",
-    "how_steps":     ["從資源中心（左側）下載樣本檔案。",
-                      "使用每個提示語向您偏好的 AI 工具（ChatGPT、Gemini、Claude 等）提問。",
-                      "將 AI 的回應貼入以下各階段。",
-                      "對比引擎將根據專業座位安排限制條件對兩個輸出進行評分。"],
-    # stages
-    "s1_badge": "第一階段", "s1_title": "普通提示方法",
-    "s1_think": "🗣 思考大聲說：在貼上回應之前，大聲描述您對沒有背景資料的基本 AI 提示有何期望。您認為 AI 會關注什麼？它會遺漏什麼？",
-    "s1_label": "將 AI 對普通提示的回應貼在此處：",
-    "s1_ph":    "例如：「以下是為您 30 位學生按字母順序排列的座位表...」",
-    "s1_check": "限制條件檢查 — 普通回應：",
-    "s1_div":   "↓ 現在試試工程化提示 ↓",
-    "s2_badge": "第二階段", "s2_title": "引導提示方法",
-    "s2_think": "🗣 思考大聲說：您已在左側看到結構化提示 — 它包含檔案、具體規則和輸出格式。預測一下：AI 現在會處理哪些之前遺漏的限制條件？",
-    "s2_label": "將 AI 對引導提示的回應貼在此處：",
-    "s2_ph":    "例如：| 排 | 座位 | 學生 | 層級 | 備注 |",
-    "s2_check": "限制條件檢查 — 引導回應：",
-    "s2_div":   "↓ 生成對比報告 ↓",
-    "s3_badge": "第三階段", "s3_title": "對比引擎",
-    "s3_think": "🗣 思考大聲說：並排查看兩個分數。這個差異告訴您什麼關於如何向 AI 發出指令的啟示？",
-    "s3_run":   "▶ 執行對比引擎",
-    "s3_reset": "↺ 重置全部",
-    "s3_info":  "請填寫第一和第二階段的文字區域以解鎖對比引擎。",
-    # dashboard
-    "dash_title":   "📊 對比儀表板",
-    "delta_text":   "引導提示在限制條件覆蓋率上比普通提示",
-    "delta_higher": "高",
-    "delta_lower":  "低",
-    "delta_pts":    "個百分點",
-    "naive_col":    "🔴 第一階段 · 普通回應",
-    "guided_col":   "🟢 第二階段 · 引導回應",
-    "coverage":     "限制條件覆蓋率",
-    "preview":      "回應預覽：",
-    "analysis":     "限制條件分析：",
-    "breakdown":    "🔬 逐項限制條件分析",
-    "col_name":     "限制條件",
-    "col_wt":       "權重",
-    "col_naive":    "普通",
-    "col_guided":   "引導",
-    "col_change":   "變化",
-    "pass":  "✅ 通過", "fail": "❌ 不通過",
-    "gained":"⬆ 獲得", "lost": "⬇ 失去", "same": "— 相同",
-    "trunc": "…(已截斷)",
-    "reflect": "🗣 最終反思：根據這個比較，寫下一條規則，您會將其加入個人 AI 提示核對清單中。您如何向剛接觸 AI 工具的同事解釋這個區別？",
-    "footer": "AI 課室管理工作坊 · 原型 · 僅供教育培訓使用",
-    # constraints
-    "c_sen":  "特殊需要學生安排在前排",       "cd_sen":  "特殊需要學生分配在前排 / 教師視線範圍內",
-    "c_eal":  "提及英語學習者 (EAL)",         "cd_eal":  "明確考慮到英語學習者",
-    "c_b1":   "提及第一組 / 高能力",           "cd_b1":   "包含高能力分組策略",
-    "c_b3":   "提及第三組 / 待發展",           "cd_b3":   "明確處理待發展學習者",
-    "c_mix":  "混合能力分組",                  "cd_mix":  "提及混合能力同伴分組策略",
-    "c_gen":  "性別平衡",                      "cd_gen":  "注明性別平衡 / 分配",
-    "c_beh":  "行為 / 衝突備注",               "cd_beh":  "遵守行為分隔限制條件",
-    "c_lay":  "結構化佈局（排 / 桌）",         "cd_lay":  "包含明確的位置 / 佈局結構",
-    "score_label": "限制條件覆蓋率分數：",
-    "score_pts":   "加權分數",
-    "naive_prompt":  "為我的 30 名學生制定座位表。",
-    "guided_prompt": ("您是一位專業的課室管理專家。請使用附件 Class_List.xlsx 和 Constraint_Ledger.pdf，"
-                      "為 14 號課室（6 排 × 5 座位）制定座位表。\n\n需遵守的規則：\n"
-                      "1. 所有特殊需要 (SEN) 學生 → 前排（第 1 排）。\n"
-                      "2. 英語學習者 (EAL) 與同組流利英語同伴配對。\n"
-                      "3. 每組應混合能力（≥1 名第一組 + ≥1 名第三組學生）。\n"
-                      "4. 每桌性別比例不超過 3:1。\n"
-                      "5. 遵守所有行為分隔備注。\n"
-                      "6. 以 Markdown 表格呈現輸出：排 | 座位 | 學生 | 層級 | 備注"),
+    /* Metric card subtle border */
+    [data-testid="stMetric"] {
+        background: #f8f9fa;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+    }
+
+    /* Stage header pill */
+    .stage-pill {
+        display: inline-block;
+        background: #1f4e79;
+        color: white;
+        border-radius: 20px;
+        padding: 4px 16px;
+        font-size: 0.85rem;
+        margin-bottom: 0.4rem;
+    }
+
+    /* Hero card */
+    .hero-card {
+        background: linear-gradient(135deg, #1f4e79 0%, #2e86c1 100%);
+        color: white;
+        border-radius: 12px;
+        padding: 2rem 2.5rem;
+        margin-bottom: 1.5rem;
+    }
+
+    /* Constraint checklist header */
+    [data-testid="stDataEditor"] { border-radius: 8px; }
+
+    /* Sidebar branding */
+    .sidebar-brand { font-size: 1.1rem; font-weight: 700; color: #1f4e79; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ──────────────────────────────────────────────
+# 2. TRANSLATIONS
+# ──────────────────────────────────────────────
+T = {
+    "English": {
+        # Global
+        "app_title": "AI Classroom Management Workshop",
+        "lang_label": "Language",
+        # Nav
+        "nav_items": [
+            "0. Workshop Overview",
+            "1. Upload Workshop Files",
+            "2. Stage 1 — Baseline Submission",
+            "3. Stage 2 — Refined Submission",
+            "4. Compare Outputs",
+            "5. Reflection + Exit Ticket",
+        ],
+        "nav_header": "Navigation",
+        # Sidebar status
+        "files_ok": "✓ Files uploaded",
+        "files_missing": "⚠ Missing files",
+        "s1_saved": "✓ Stage 1 saved",
+        "s1_missing": "⚠ Stage 1 pending",
+        "s2_saved": "✓ Stage 2 saved",
+        "s2_missing": "⚠ Stage 2 pending",
+        # Page 0
+        "p0_title": "AI Classroom Management Workshop",
+        "p0_caption": "Compare naïve vs guided prompting to create better seating plans.",
+        "p0_students": "Students",
+        "p0_constraints": "Constraints",
+        "p0_stages": "Stages",
+        "p0_how": "How it works",
+        "p0_steps": [
+            "**Upload** the three workshop resource files (Class List, Constraint Ledger, Template).",
+            "**Stage 1** — Use the baseline (naïve) prompt and paste the AI output.",
+            "**Stage 2** — Use the guided prompt and paste the refined AI output.",
+            "**Compare** both outputs side-by-side with the manual constraint checklist.",
+            "**Reflect** and complete the exit ticket.",
+        ],
+        "p0_facilitator": "Facilitator Notes",
+        "p0_facilitator_body": (
+            "Encourage teachers to notice what changes between Stage 1 and Stage 2. "
+            "The constraint checklist helps make improvements concrete and measurable. "
+            "Allow ~10 min per stage and ~15 min for the comparison discussion."
+        ),
+        "p0_cta": "Go to Step 1: Upload Workshop Files",
+        # Page 1
+        "p1_title": "Upload Workshop Files",
+        "p1_classlist": "Class List",
+        "p1_classlist_up": "Upload Class List",
+        "p1_constraints_lbl": "Constraint Ledger",
+        "p1_constraints_up": "Upload Constraint Ledger",
+        "p1_template": "Seating Plan Template",
+        "p1_template_up": "Upload Seating Plan Template",
+        "p1_preview": "Preview",
+        "p1_all_ok": "✅ All required workshop files uploaded.",
+        "p1_missing": "⚠️ Please upload all three required files before continuing.",
+        "p1_continue": "Continue to Stage 1 →",
+        "p1_download": "Download",
+        "p1_meta": "Uploaded: **{name}** ({size} KB)",
+        # Page 2
+        "p2_title": "Stage 1 — Baseline (Naïve Prompting)",
+        "p2_caption": "Use the simple prompt below and submit the AI seating plan output.",
+        "p2_prompt_label": "Prompt to use:",
+        "p2_tab_paste": "Paste Output",
+        "p2_tab_upload": "Upload Document",
+        "p2_paste_label": "Paste AI Output (Stage 1)",
+        "p2_upload_label": "Upload Stage 1 Output File",
+        "p2_preview": "Submission Preview",
+        "p2_save": "Save Stage 1 Submission",
+        "p2_saved_ok": "Stage 1 submission saved.",
+        "p2_download_sub": "Download Stage 1 Submission File",
+        # Page 3
+        "p3_title": "Stage 2 — Refined (Guided Prompting)",
+        "p3_caption": "Use the guided structured prompt below and submit the refined AI output.",
+        "p3_paste_label": "Paste AI Output (Stage 2)",
+        "p3_upload_label": "Upload Stage 2 Output File",
+        "p3_preview": "Submission Preview",
+        "p3_save": "Save Stage 2 Submission",
+        "p3_saved_ok": "Stage 2 submission saved.",
+        "p3_download_sub": "Download Stage 2 Submission File",
+        # Page 4
+        "p4_title": "Comparison View — Before vs After",
+        "p4_caption": "Facilitator-led discussion: review improvements and constraints addressed.",
+        "p4_s1_header": "### Stage 1 — Baseline",
+        "p4_s2_header": "### Stage 2 — Refined",
+        "p4_notes_label": "Facilitator Notes (Key Differences)",
+        "p4_checklist_header": "Constraint Checklist (Manual Review)",
+        "p4_checklist_tip": (
+            "💡 Prompt: Ask teachers which constraints appeared **only** after the guided prompt."
+        ),
+        "p4_col_constraint": "Constraint",
+        "p4_col_s1": "Stage 1 ✓",
+        "p4_col_s2": "Stage 2 ✓",
+        "p4_col_notes": "Notes",
+        "p4_reset_compare": "Reset Comparison Notes",
+        "p4_reset_all": "Reset All Workshop Data",
+        "p4_soft_reset": "Reset Submissions Only",
+        "p4_download_csv": "Download Checklist as CSV",
+        "p4_gate_warn": "⚠️ Complete Stage 1 and Stage 2 submissions first.",
+        "p4_s1_empty": "_No Stage 1 text submitted._",
+        "p4_s2_empty": "_No Stage 2 text submitted._",
+        # Page 5
+        "p5_title": "Reflection + Exit Ticket",
+        "p5_q1": "What changed most between Stage 1 and Stage 2?",
+        "p5_q2": "Which constraints did the AI miss initially?",
+        "p5_q3": "What prompt-writing rule will you adopt?",
+        "p5_rating": "How useful was this activity? (1 = low, 5 = high)",
+        "p5_name": "Teacher name (optional)",
+        "p5_school": "School (optional)",
+        "p5_submit": "Submit Reflection",
+        "p5_thanks": "✅ Reflection submitted. Thank you!",
+        "p5_download_json": "Download Session Summary (JSON)",
+        "p5_not_submitted": "Complete the form above and submit your reflection.",
+    },
+    "繁體中文": {
+        # Global
+        "app_title": "AI 教室管理工作坊",
+        "lang_label": "語言",
+        # Nav
+        "nav_items": [
+            "0. 工作坊概覽",
+            "1. 上傳工作坊檔案",
+            "2. 第一階段 — 基線提交",
+            "3. 第二階段 — 精煉提交",
+            "4. 比較輸出",
+            "5. 反思 + 離場問卷",
+        ],
+        "nav_header": "導覽",
+        "files_ok": "✓ 檔案已上傳",
+        "files_missing": "⚠ 檔案缺失",
+        "s1_saved": "✓ 第一階段已儲存",
+        "s1_missing": "⚠ 第一階段待完成",
+        "s2_saved": "✓ 第二階段已儲存",
+        "s2_missing": "⚠ 第二階段待完成",
+        # Page 0
+        "p0_title": "AI 教室管理工作坊",
+        "p0_caption": "比較樸素提示與引導提示，以創建更優質的座位計劃。",
+        "p0_students": "學生人數",
+        "p0_constraints": "限制條件",
+        "p0_stages": "階段",
+        "p0_how": "運作方式",
+        "p0_steps": [
+            "**上傳**三個工作坊資源檔案（學生名單、限制條件表、座位計劃模板）。",
+            "**第一階段** — 使用基線（樸素）提示，並貼上 AI 輸出結果。",
+            "**第二階段** — 使用引導式提示，並貼上優化後的 AI 輸出結果。",
+            "**比較**兩個輸出結果，並使用手動限制條件核對清單進行對比。",
+            "**反思**並完成離場問卷。",
+        ],
+        "p0_facilitator": "主持人備註",
+        "p0_facilitator_body": (
+            "鼓勵教師注意第一階段和第二階段之間的變化。"
+            "限制條件核對清單有助於將改進之處具體化和可量化。"
+            "每個階段大約需要 10 分鐘，比較討論大約需要 15 分鐘。"
+        ),
+        "p0_cta": "前往步驟 1：上傳工作坊檔案",
+        # Page 1
+        "p1_title": "上傳工作坊檔案",
+        "p1_classlist": "學生名單",
+        "p1_classlist_up": "上傳學生名單",
+        "p1_constraints_lbl": "限制條件表",
+        "p1_constraints_up": "上傳限制條件表",
+        "p1_template": "座位計劃模板",
+        "p1_template_up": "上傳座位計劃模板",
+        "p1_preview": "預覽",
+        "p1_all_ok": "✅ 所有必要工作坊檔案已上傳。",
+        "p1_missing": "⚠️ 請上傳所有三個必要檔案後再繼續。",
+        "p1_continue": "繼續至第一階段 →",
+        "p1_download": "下載",
+        "p1_meta": "已上傳：**{name}** ({size} KB)",
+        # Page 2
+        "p2_title": "第一階段 — 基線（樸素提示）",
+        "p2_caption": "使用下方簡單提示，並提交 AI 座位計劃輸出結果。",
+        "p2_prompt_label": "使用的提示：",
+        "p2_tab_paste": "貼上輸出",
+        "p2_tab_upload": "上傳文件",
+        "p2_paste_label": "貼上 AI 輸出（第一階段）",
+        "p2_upload_label": "上傳第一階段輸出檔案",
+        "p2_preview": "提交預覽",
+        "p2_save": "儲存第一階段提交",
+        "p2_saved_ok": "第一階段提交已儲存。",
+        "p2_download_sub": "下載第一階段提交檔案",
+        # Page 3
+        "p3_title": "第二階段 — 精煉（引導式提示）",
+        "p3_caption": "使用下方引導式結構化提示，並提交優化後的 AI 輸出結果。",
+        "p3_paste_label": "貼上 AI 輸出（第二階段）",
+        "p3_upload_label": "上傳第二階段輸出檔案",
+        "p3_preview": "提交預覽",
+        "p3_save": "儲存第二階段提交",
+        "p3_saved_ok": "第二階段提交已儲存。",
+        "p3_download_sub": "下載第二階段提交檔案",
+        # Page 4
+        "p4_title": "比較視圖 — 前後對比",
+        "p4_caption": "主持人引導討論：審查改進之處及已解決的限制條件。",
+        "p4_s1_header": "### 第一階段 — 基線",
+        "p4_s2_header": "### 第二階段 — 精煉",
+        "p4_notes_label": "主持人備註（主要差異）",
+        "p4_checklist_header": "限制條件核對清單（手動審查）",
+        "p4_checklist_tip": "💡 提示：詢問教師哪些限制條件**僅在**引導式提示後才出現。",
+        "p4_col_constraint": "限制條件",
+        "p4_col_s1": "第一階段 ✓",
+        "p4_col_s2": "第二階段 ✓",
+        "p4_col_notes": "備註",
+        "p4_reset_compare": "重置比較備註",
+        "p4_reset_all": "重置所有工作坊資料",
+        "p4_soft_reset": "僅重置提交內容",
+        "p4_download_csv": "下載核對清單為 CSV",
+        "p4_gate_warn": "⚠️ 請先完成第一階段和第二階段的提交。",
+        "p4_s1_empty": "_未提交第一階段文字。_",
+        "p4_s2_empty": "_未提交第二階段文字。_",
+        # Page 5
+        "p5_title": "反思 + 離場問卷",
+        "p5_q1": "第一階段和第二階段之間最大的變化是什麼？",
+        "p5_q2": "AI 最初遺漏了哪些限制條件？",
+        "p5_q3": "您將採用什麼提示撰寫規則？",
+        "p5_rating": "此活動的實用性如何？（1 = 低，5 = 高）",
+        "p5_name": "教師姓名（選填）",
+        "p5_school": "學校（選填）",
+        "p5_submit": "提交反思",
+        "p5_thanks": "✅ 反思已提交。謝謝！",
+        "p5_download_json": "下載工作坊摘要（JSON）",
+        "p5_not_submitted": "請完成上方表格並提交您的反思。",
+    },
 }
 
-EN = {
-    "page_title":    "AI Classroom Management Workshop",
-    "page_subtitle": "Workshop Module · Seating Plan Design — Comparing Naïve vs. Guided AI Prompting",
-    "lang_btn":      "🌐 切換至繁體中文",
-    "res_hub":       "📦 Resource Hub",
-    "res_sub":       "Download these files before starting the workshop",
-    "cl_title":      "📋 Class List",
-    "cl_desc":       "30 students · Name, Gender, Academic Tier, Special Needs",
-    "cl_btn":        "⬇ Download Class_List.xlsx",
-    "pdf_title":     "📄 Constraint Ledger",
-    "pdf_desc":      "SEN rules · Mixed ability · Room layout · Behaviour notes",
-    "pdf_btn":       "⬇ Download Constraint_Ledger.pdf",
-    "prompt_ref":    "💡 Prompt Reference",
-    "s1_prompt_lbl": "Stage 1 · Naïve Prompt",
-    "s2_prompt_lbl": "Stage 2 · Guided Prompt",
-    "goals_title":   "🎯 Workshop Goals",
-    "goals":         ["Understand prompt engineering quality differences",
-                      "Practice constraint-aware AI prompting",
-                      "Evaluate AI outputs against professional standards"],
-    "m_students":    "Students",
-    "m_constraints": "Constraints",
-    "m_stages":      "Stages",
-    "how_title":     "How this workshop works:",
-    "how_steps":     ["Download the sample files from the Resource Hub (left panel).",
-                      "Use each prompt card to query your preferred AI tool (ChatGPT, Gemini, Claude, etc.).",
-                      "Paste the AI's response into the relevant stage below.",
-                      "The Contrast Engine will score both outputs against professional seating constraints."],
-    "s1_badge": "Stage 1", "s1_title": "The Naïve Approach",
-    "s1_think": "🗣 Think-Aloud: Before you paste, describe out loud what you expect from a basic AI prompt with no context. What will the AI focus on? What will it miss?",
-    "s1_label": "Paste the AI's response to the naïve prompt here:",
-    "s1_ph":    "e.g. Here is a simple seating plan for your 30 students arranged alphabetically...",
-    "s1_check": "Constraint Check — Naïve Response:",
-    "s1_div":   "↓ Now try the engineered prompt ↓",
-    "s2_badge": "Stage 2", "s2_title": "The Guided Approach",
-    "s2_think": "🗣 Think-Aloud: You've seen the structured prompt — files, specific rules, output format. Predict: which constraints will the AI now address that it missed before?",
-    "s2_label": "Paste the AI's response to the guided prompt here:",
-    "s2_ph":    "e.g. | Row | Seat | Student | Tier | Notes |",
-    "s2_check": "Constraint Check — Guided Response:",
-    "s2_div":   "↓ Generate the contrast report ↓",
-    "s3_badge": "Stage 3", "s3_title": "The Contrast Engine",
-    "s3_think": "🗣 Think-Aloud: Look at the two scores side by side. What does the difference tell you about how you give instructions to an AI?",
-    "s3_run":   "▶ Run Contrast Engine",
-    "s3_reset": "↺ Reset All",
-    "s3_info":  "Fill in both Stage 1 and Stage 2 text areas to unlock the Contrast Engine.",
-    "dash_title":   "📊 Comparison Dashboard",
-    "delta_text":   "The Guided Prompt scored",
-    "delta_higher": "higher",
-    "delta_lower":  "lower",
-    "delta_pts":    "percentage points",
-    "naive_col":    "🔴 Stage 1 · Naïve Response",
-    "guided_col":   "🟢 Stage 2 · Guided Response",
-    "coverage":     "Constraint Coverage",
-    "preview":      "Response Preview:",
-    "analysis":     "Constraint Analysis:",
-    "breakdown":    "🔬 Constraint-by-Constraint Breakdown",
-    "col_name":     "Constraint",
-    "col_wt":       "Weight",
-    "col_naive":    "Naïve",
-    "col_guided":   "Guided",
-    "col_change":   "Change",
-    "pass":  "✅ Pass",   "fail": "❌ Fail",
-    "gained":"⬆ Gained", "lost": "⬇ Lost",  "same": "— Same",
-    "trunc": "…(truncated)",
-    "reflect": "🗣 Final Reflection: Write down one rule you would add to your AI prompting checklist. How would you teach this to a colleague new to AI tools?",
-    "footer": "AI-Powered Classroom Management Workshop · Prototype · For educational training purposes only",
-    "c_sen":  "SEN placed front row",        "cd_sen":  "SEN students assigned to front row / teacher proximity",
-    "c_eal":  "EAL students mentioned",      "cd_eal":  "EAL learners explicitly considered",
-    "c_b1":   "Band 1 / High ability",       "cd_b1":   "High-ability grouping strategy present",
-    "c_b3":   "Band 3 / Developing",         "cd_b3":   "Developing learners explicitly addressed",
-    "c_mix":  "Mixed ability grouping",      "cd_mix":  "Mixed-ability peer grouping mentioned",
-    "c_gen":  "Gender balance",              "cd_gen":  "Gender balance / distribution noted",
-    "c_beh":  "Behaviour / conflict notes",  "cd_beh":  "Behaviour separation constraints honoured",
-    "c_lay":  "Structured layout",           "cd_lay":  "Explicit positional / layout structure present",
-    "score_label": "Constraint Coverage Score:",
-    "score_pts":   "weighted points",
-    "naive_prompt":  "Create a seating plan for my class of 30 students.",
-    "guided_prompt": ("You are an expert classroom manager. Using the attached Class_List.xlsx "
-                      "and Constraint_Ledger.pdf, generate a seating plan for Room 14 (6 rows x 5 seats).\n\n"
-                      "Rules to follow:\n"
-                      "1. All SEN students -> Front Row (Row 1).\n"
-                      "2. EAL students paired with fluent English Band 1/2 peer.\n"
-                      "3. Every table group: mixed ability (>=1 Band 1 + >=1 Band 3).\n"
-                      "4. No more than 3:1 gender ratio per table.\n"
-                      "5. Honour all behaviour separation notes.\n"
-                      "6. Output as Markdown table: Row | Seat | Student | Tier | Notes"),
+# ──────────────────────────────────────────────
+# 3. PROMPTS
+# ──────────────────────────────────────────────
+NAIVE_PROMPT = {
+    "English": """\
+Create a seating plan for my class of 30 students.
+""",
+    "繁體中文": """\
+為我的 30 名學生班級制定座位計劃。
+""",
 }
 
-LANGS = {"zh": ZH, "en": EN}
+GUIDED_PROMPT = {
+    "English": """\
+You are an expert classroom management assistant.
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. SESSION STATE
-# ══════════════════════════════════════════════════════════════════════════════
+Task: Generate a detailed seating plan for a class of 30 students.
 
-DEFAULTS = {
-    "lang":            "zh",
-    "naive_text":      "",
-    "guided_text":     "",
-    "show_comparison": False,
-    "action":          "",   # last postMessage action
+Requirements:
+1. Use the attached Class List which includes student names, learning needs, and
+   any flagged behaviours.
+2. Strictly respect ALL constraints listed in the Constraint Ledger:
+   - Separate students with recorded conflicts.
+   - Place students with visual/hearing impairments near the front.
+   - Distribute high-engagement students evenly across rows.
+   - Keep EAL (English as Additional Language) students near a bilingual peer.
+   - Honour any teacher-specific notes per student.
+   - Ensure no two students on a behaviour plan sit adjacent.
+   - Place students who require frequent teacher support in accessible seats.
+   - Maintain gender balance per table group where possible.
+3. Output format: a grid table (rows × columns) with student names in each cell.
+4. After the grid, provide a brief justification (2–3 sentences) for any
+   non-obvious placement decision.
+5. Flag any constraint that could NOT be satisfied and explain why.
+""",
+    "繁體中文": """\
+您是一位專業的教室管理助理。
+
+任務：為 30 名學生的班級生成詳細的座位計劃。
+
+要求：
+1. 使用附帶的學生名單，其中包括學生姓名、學習需求和任何標記的行為。
+2. 嚴格遵守限制條件表中列出的所有限制條件：
+   - 分開有記錄衝突的學生。
+   - 將有視力/聽力障礙的學生安排在前排。
+   - 將高參與度學生均勻分佈在各排。
+   - 將英語作為附加語言（EAL）的學生安排在雙語同伴附近。
+   - 遵守每位學生的教師特定備註。
+   - 確保沒有兩名有行為計劃的學生相鄰而坐。
+   - 將需要頻繁教師支持的學生安排在易於到達的座位。
+   - 盡可能在每個桌組保持性別平衡。
+3. 輸出格式：帶有每個格子中學生姓名的網格表（行 × 列）。
+4. 在網格之後，為任何非顯而易見的安排決定提供簡短的理由（2-3 句話）。
+5. 標記任何無法滿足的限制條件並解釋原因。
+""",
 }
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
 
-def S(key):
-    """Get translated string for current language."""
-    return LANGS[st.session_state.lang][key]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. CONSTRAINT ENGINE (pure Python — no Streamlit components)
-# ══════════════════════════════════════════════════════════════════════════════
-
-CONSTRAINT_DEFS = [
-    # (label_key, desc_key, keywords_en, keywords_zh, weight)
-    ("c_sen", "cd_sen", ["sen","front row","row 1","first row","special needs"], ["特殊需要","前排","第一排","sEN"], 3),
-    ("c_eal", "cd_eal", ["eal","english as additional","language support"],      ["英語學習者","英語支援"],         2),
-    ("c_b1",  "cd_b1",  ["band 1","high ability","gifted","g&t","talented"],     ["第一組","高能力","資優"],        2),
-    ("c_b3",  "cd_b3",  ["band 3","developing","lower ability"],                  ["第三組","待發展","低能力"],     2),
-    ("c_mix", "cd_mix", ["mixed ability","peer learning","mixed group","heterogeneous"], ["混合能力","同伴學習"],   2),
-    ("c_gen", "cd_gen", ["gender","male","female","boy","girl"],                  ["性別","男","女"],               1),
-    ("c_beh", "cd_beh", ["behaviour","behavior","conflict","separate","away from","do not seat"], ["行為","衝突","分隔","遠離"], 2),
-    ("c_lay", "cd_lay", ["row","table","seat","column","front","back","position"],["排","座位","前","後","位置"],   1),
+# Default constraint list (8 items)
+DEFAULT_CONSTRAINTS = [
+    "Separate students with recorded conflicts",
+    "Visual/hearing impairments near front",
+    "High-engagement students distributed evenly",
+    "EAL students near bilingual peer",
+    "Teacher-specific notes honoured",
+    "No two behaviour-plan students adjacent",
+    "Students needing support in accessible seats",
+    "Gender balance per table group",
 ]
 
-def run_check(text: str) -> dict:
-    tl = text.lower()
-    results, total_w, earned_w = [], 0, 0
-    for lk, dk, kw_en, kw_zh, w in CONSTRAINT_DEFS:
-        passed = any(k in tl for k in kw_en + kw_zh)
-        results.append({"name": S(lk), "desc": S(dk), "passed": passed, "weight": w})
-        total_w  += w
-        earned_w += w if passed else 0
-    score = round(earned_w / total_w * 100) if total_w else 0
-    return {"checks": results, "score": score, "earned": earned_w, "total": total_w}
+DEFAULT_CONSTRAINTS_ZH = [
+    "分開有記錄衝突的學生",
+    "視力/聽力障礙學生靠近前排",
+    "高參與度學生均勻分佈",
+    "EAL 學生靠近雙語同伴",
+    "遵守教師特定備註",
+    "無兩名有行為計劃的學生相鄰",
+    "需要支持的學生坐在易到達的座位",
+    "每個桌組盡量保持性別平衡",
+]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. IN-MEMORY FILE GENERATORS
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# 4. SESSION STATE INITIALISATION
+# ──────────────────────────────────────────────
 
-@st.cache_data
-def gen_xlsx() -> bytes:
-    first = ["Amara","Ben","Chloe","David","Evie","Finn","Grace","Henry","Imani","Jake",
-             "Kezia","Liam","Mia","Noah","Olivia","Priya","Quinn","Reuben","Sofia","Theo",
-             "Uma","Victor","Wren","Xander","Yara","Zoe","Aiden","Bella","Carlos","Dara"]
-    last  = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis",
-             "Martinez","Wilson","Anderson","Taylor","Thomas","Hernandez","Moore",
-             "Martin","Jackson","Thompson","White","Lopez","Lee","Harris","Clark",
-             "Lewis","Robinson","Walker","Perez","Hall","Young","Allen"]
-    genders = ["Male / 男","Female / 女","Non-binary / 非二元"]
-    tiers   = ["Band 1 (High / 高)","Band 2 (Mid / 中)","Band 3 (Developing / 待發展)"]
-    needs   = ["None / 無","EAL / 英語學習者","SEN - Dyslexia / 讀寫困難","SEN - ADHD / 專注力不足",
-               "SEN - Visual Impairment / 視障","SEN - Hearing Impairment / 聽障",
-               "Gifted & Talented / 資優","LAC / 受照顧兒童"]
-    beh     = ["","","","Seat away from windows / 遠離窗戶","Needs frequent breaks / 需要頻繁休息",
-               "Do not seat next to [peer conflict] / 勿與指定同學相鄰","Seat near teacher / 靠近教師"]
-    random.seed(42)
-    rows = [{"Student ID": f"S{1000+i}",
-             "Name / 姓名": f"{first[i]} {last[i]}",
-             "Gender / 性別": random.choices(genders,[48,48,4])[0],
-             "Academic Tier / 學術層級": random.choices(tiers,[30,45,25])[0],
-             "Special Needs / 特殊需要": random.choices(needs,[50,10,8,8,4,4,10,6])[0],
-             "Reading Age (yrs) / 閱讀年齡": round(random.uniform(8.5,16.0),1),
-             "Behaviour Note / 行為備注": random.choice(beh)} for i in range(30)]
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        pd.DataFrame(rows).to_excel(w, index=False, sheet_name="Class List")
-    return buf.getvalue()
+def init_session_state() -> None:
+    defaults: dict = {
+        "lang": "English",
+        "nav_step": 0,
+        # Workshop files
+        "workshop_files": {
+            "class_list": None,
+            "constraint_ledger": None,
+            "template": None,
+        },
+        # Stage submissions
+        "stage1_text": "",
+        "stage1_file": None,
+        "stage2_text": "",
+        "stage2_file": None,
+        "stage1_saved": False,
+        "stage2_saved": False,
+        # Comparison
+        "comparison_notes": "",
+        "constraint_checklist": None,   # will hold edited df as records
+        # Reflection
+        "ref_q1": "",
+        "ref_q2": "",
+        "ref_q3": "",
+        "ref_rating": 3,
+        "ref_name": "",
+        "ref_school": "",
+        "reflection_submitted": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-@st.cache_data
-def gen_pdf() -> bytes:
-    try:
-        from fpdf import FPDF
-    except ImportError:
-        return b"%PDF-1.4 placeholder"
-    pdf = FPDF(); pdf.set_auto_page_break(auto=True, margin=15); pdf.add_page()
-    pdf.set_font("Helvetica","B",16); pdf.set_text_color(46,125,50)
-    pdf.cell(0,10,"Seating Plan Constraint Ledger",ln=True,align="C")
-    pdf.cell(0,7,"座位表限制條件表",ln=True,align="C")
-    pdf.set_font("Helvetica","",9); pdf.set_text_color(100,100,100)
-    pdf.cell(0,5,"Year 9 Science · Room 14 | 中三科學 · 14 號課室",ln=True,align="C")
-    pdf.ln(4); pdf.set_draw_color(46,125,50); pdf.set_line_width(0.5)
-    pdf.line(10,pdf.get_y(),200,pdf.get_y()); pdf.ln(4)
-    secs = [
-        ("MANDATORY CONSTRAINTS 強制限制條件",[
-            ("SEN Placements 特殊需要","All SEN must be in front two rows.\n所有SEN學生須在前兩排。"),
-            ("EAL Support 英語學習者","EAL paired with fluent English peer.\nEAL學生應與流利英語同伴配對。"),
-            ("Visual/Hearing 視聽障礙","Must occupy Front Row seats 1–4.\n必須坐在前排第1-4號座位。"),
-            ("Behaviour 行為分隔","Min one row/column gap from named peer.\n與指定同學相隔至少一整排或列。"),
-        ]),
-        ("PEDAGOGICAL 教學限制條件",[
-            ("Mixed Ability 混合能力","Each group: ≥1 Band1 + ≥1 Band3.\n每組：≥1名第一組+≥1名第三組。"),
-            ("Gender 性別","Max 3:1 ratio per table.\n每桌最多3:1比例。"),
-            ("G&T 資優生","Group together or distribute.\n集中或分散各組。"),
-        ]),
-        ("ROOM LAYOUT 課室佈局",[
-            ("Front Row 前排","Row 1 = nearest whiteboard. 6×5=30 seats.\n第1排=最靠近白板，6排×5座=30座。"),
-            ("Egress 出口","A1 and F5 always accessible.\nA1和F5須隨時通暢。"),
-            ("Gas Taps 煤氣","Row 6 has taps; avoid Band3/ADHD there.\n第6排有煤氣；避免第三組/ADHD在此。"),
-        ]),
+
+def soft_reset() -> None:
+    """Clear stage submissions, comparison, reflection — keep workshop files."""
+    keys_to_clear = [
+        "stage1_text", "stage1_file", "stage2_text", "stage2_file",
+        "stage1_saved", "stage2_saved",
+        "comparison_notes", "constraint_checklist",
+        "ref_q1", "ref_q2", "ref_q3", "ref_rating",
+        "ref_name", "ref_school", "reflection_submitted",
     ]
-    for st_title, items in secs:
-        pdf.set_font("Helvetica","B",11); pdf.set_text_color(46,125,50)
-        pdf.set_fill_color(232,245,233); pdf.cell(0,8,f"  {st_title}",ln=True,fill=True); pdf.ln(2)
-        for c,d in items:
-            pdf.set_font("Helvetica","B",9); pdf.set_text_color(27,94,32)
-            pdf.cell(5); pdf.cell(0,5,f"• {c}",ln=True)
-            pdf.set_font("Helvetica","",8); pdf.set_text_color(60,60,60)
-            pdf.set_x(15); pdf.multi_cell(0,4.5,d); pdf.ln(1)
-        pdf.ln(3)
-    pdf.set_y(-18); pdf.set_font("Helvetica","I",7); pdf.set_text_color(160,160,160)
-    pdf.cell(0,5,"AI Classroom Management Workshop · Training purposes only · 僅供培訓使用",align="C")
-    return pdf.output()
+    for k in keys_to_clear:
+        if k in ("stage1_text", "stage2_text", "comparison_notes",
+                 "ref_q1", "ref_q2", "ref_q3", "ref_name", "ref_school"):
+            st.session_state[k] = ""
+        elif k in ("ref_rating",):
+            st.session_state[k] = 3
+        elif k in ("stage1_saved", "stage2_saved", "reflection_submitted"):
+            st.session_state[k] = False
+        else:
+            st.session_state[k] = None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. HTML BUILDER — the entire UI as one self-contained document
-#    No external JS, no dynamic imports, no lazy chunks.
-# ══════════════════════════════════════════════════════════════════════════════
 
-def js_str(s: str) -> str:
-    """Safely escape a Python string for embedding in a JS string literal."""
-    return json.dumps(str(s))
+def hard_reset() -> None:
+    """Clear everything except lang."""
+    lang = st.session_state.get("lang", "English")
+    keys_to_keep = {"lang"}
+    for k in list(st.session_state.keys()):
+        if k not in keys_to_keep:
+            del st.session_state[k]
+    st.session_state["lang"] = lang
+    init_session_state()
 
-def build_check_html(result: dict) -> str:
-    """Build inline HTML for constraint badges + score bar."""
-    score = result["score"]
-    color = "#2E7D32" if score >= 70 else ("#E65100" if score >= 40 else "#C62828")
-    badges = "".join(
-        f'<span class="badge {"pass" if c["passed"] else "fail"}">{"✓" if c["passed"] else "✗"} {c["name"]}</span>'
-        for c in result["checks"]
+
+# ──────────────────────────────────────────────
+# 5. HELPERS
+# ──────────────────────────────────────────────
+
+def t(key: str) -> str:
+    """Shorthand translation lookup."""
+    lang = st.session_state.get("lang", "English")
+    return T[lang].get(key, key)
+
+
+def all_files_uploaded() -> bool:
+    wf = st.session_state.workshop_files
+    return all(wf[k] is not None for k in ("class_list", "constraint_ledger", "template"))
+
+
+def file_bytes(file_dict: dict | None) -> bytes | None:
+    if file_dict:
+        return file_dict.get("bytes")
+    return None
+
+
+def build_constraint_df() -> pd.DataFrame:
+    lang = st.session_state.get("lang", "English")
+    constraints = DEFAULT_CONSTRAINTS if lang == "English" else DEFAULT_CONSTRAINTS_ZH
+    return pd.DataFrame(
+        {
+            t("p4_col_constraint"): constraints,
+            t("p4_col_s1"): [False] * len(constraints),
+            t("p4_col_s2"): [False] * len(constraints),
+            t("p4_col_notes"): [""] * len(constraints),
+        }
     )
-    sl = S("score_label"); sp = S("score_pts")
-    e, t = result["earned"], result["total"]
-    return f"""
-    <div class="score-wrap">
-      <div class="score-label">{sl} <strong style="color:{color}">{score}%</strong>
-        ({e}/{t} {sp})</div>
-      <div class="score-bg"><div class="score-fill" style="width:{score}%"></div></div>
-    </div>
-    <div class="badge-grid">{badges}</div>"""
 
-def build_comparison_html(naive_r: dict, guided_r: dict) -> str:
-    """Build the full comparison dashboard HTML."""
-    delta       = guided_r["score"] - naive_r["score"]
-    dc          = "#2E7D32" if delta > 0 else ("#C62828" if delta < 0 else "#607D8B")
-    ds          = f"+{delta}" if delta > 0 else str(delta)
-    direction   = S("delta_higher") if delta >= 0 else S("delta_lower")
-    dt, dpts    = S("delta_text"), S("delta_pts")
 
-    def col_html(result, css, title, color, text):
-        preview = text[:800].replace("<","&lt;").replace(">","&gt;")
-        if len(text) > 800: preview += S("trunc")
-        rows_html = "".join(
-            f'<div class="analysis-row">{"✅" if c["passed"] else "❌"} '
-            f'<strong>{c["name"]}</strong> — <em>{c["desc"]}</em></div>'
-            for c in result["checks"]
+def session_summary() -> str:
+    """Serialise session state to JSON (bytes-safe)."""
+    safe: dict = {}
+    for k, v in st.session_state.items():
+        if isinstance(v, dict) and "bytes" in str(type(list(v.values())[0]) if v else ""):
+            # workshop_files contain bytes — just store metadata
+            safe[k] = {
+                sub_k: (
+                    {"filename": sub_v["filename"], "mime": sub_v["mime"],
+                     "size_bytes": len(sub_v["bytes"])}
+                    if sub_v and isinstance(sub_v, dict) and "bytes" in sub_v
+                    else sub_v
+                )
+                for sub_k, sub_v in v.items()
+            }
+        elif isinstance(v, bytes):
+            safe[k] = f"<bytes len={len(v)}>"
+        elif isinstance(v, pd.DataFrame):
+            safe[k] = v.to_dict(orient="records")
+        else:
+            safe[k] = v
+    return json.dumps(safe, ensure_ascii=False, indent=2, default=str)
+
+
+def store_uploaded_file(uploaded, slot_key: str) -> None:
+    """Store a Streamlit UploadedFile into workshop_files."""
+    if uploaded is not None:
+        st.session_state.workshop_files[slot_key] = {
+            "filename": uploaded.name,
+            "bytes": uploaded.getvalue(),
+            "mime": uploaded.type,
+        }
+
+
+# ──────────────────────────────────────────────
+# 6. TOP BAR  (language toggle)
+# ──────────────────────────────────────────────
+
+def render_top_bar() -> None:
+    col_title, col_spacer, col_lang = st.columns([7, 2, 1])
+    with col_title:
+        st.markdown(f"### 🏫 {t('app_title')}")
+    with col_lang:
+        chosen = st.radio(
+            t("lang_label"),
+            options=["English", "繁體中文"],
+            index=0 if st.session_state.lang == "English" else 1,
+            horizontal=True,
+            key="_lang_radio",
+            label_visibility="collapsed",
         )
-        pv, an = S("preview"), S("analysis")
-        return f"""
-        <div class="cmp-col {css}">
-          <h4>{title}</h4>
-          <div class="big-score" style="color:{color}">{result["score"]}%</div>
-          <div class="cov-label">{S("coverage")}</div>
-          <div class="preview-label">{pv}</div>
-          <div class="preview-box">{preview}</div>
-          <div class="preview-label">{an}</div>
-          {rows_html}
-        </div>"""
+        if chosen != st.session_state.lang:
+            st.session_state.lang = chosen
+            st.rerun()
 
-    naive_html  = col_html(naive_r,  "naive-col",  S("naive_col"),  "#EF5350",
-                           st.session_state.naive_text)
-    guided_html = col_html(guided_r, "guided-col", S("guided_col"), "#2E7D32",
-                           st.session_state.guided_text)
 
-    # breakdown table
-    rows = []
-    for nd, gd in zip(naive_r["checks"], guided_r["checks"]):
-        ch = (S("gained") if (not nd["passed"] and gd["passed"]) else
-              S("lost")   if (nd["passed"]  and not gd["passed"]) else S("same"))
-        rows.append(
-            f'<tr><td>{nd["name"]}</td><td>{nd["weight"]}pt</td>'
-            f'<td>{"✅" if nd["passed"] else "❌"}</td>'
-            f'<td>{"✅" if gd["passed"] else "❌"}</td>'
-            f'<td>{ch}</td></tr>'
+# ──────────────────────────────────────────────
+# 7. SIDEBAR
+# ──────────────────────────────────────────────
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown('<p class="sidebar-brand">EduLearn Institute</p>', unsafe_allow_html=True)
+        st.divider()
+
+        nav_labels = t("nav_items")
+        current = st.session_state.nav_step
+
+        selected = st.radio(
+            t("nav_header"),
+            options=list(range(len(nav_labels))),
+            format_func=lambda i: nav_labels[i],
+            index=current,
+            key="nav_step_radio",
         )
-    rows_html = "\n".join(rows)
-    cn,cw,cnv,cgu,cc = S("col_name"),S("col_wt"),S("col_naive"),S("col_guided"),S("col_change")
+        if selected != st.session_state.nav_step:
+            st.session_state.nav_step = selected
+            st.rerun()
 
-    reflect = S("reflect")
-    bd_title = S("breakdown")
-    dash_title = S("dash_title")
+        st.divider()
+        st.markdown("**Status**")
 
-    return f"""
-    <div class="dash-banner">
-      <span style="font-size:1.6rem">📈</span>
-      <span>{dt} <strong style="color:{dc}">{ds} {dpts}</strong> {direction}</span>
-    </div>
-    <h3 style="color:#1B5E20;margin:1rem 0 .75rem">{dash_title}</h3>
-    <div class="cmp-grid">
-      {naive_html}
-      {guided_html}
-    </div>
-    <hr style="border:none;border-top:1px solid #C8E6C9;margin:1.4rem 0">
-    <h4 style="color:#1B5E20">{bd_title}</h4>
-    <table class="breakdown-table">
-      <thead><tr><th>{cn}</th><th>{cw}</th><th>{cnv}</th><th>{cgu}</th><th>{cc}</th></tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-    <div class="think-aloud" style="margin-top:1.2rem">{reflect}</div>
-    """
+        if all_files_uploaded():
+            st.success(t("files_ok"))
+        else:
+            st.warning(t("files_missing"))
 
-def build_full_html() -> str:
-    """
-    Render the ENTIRE app as one self-contained HTML page.
-    All state is passed in as JSON; user actions are sent back via
-    window.parent.postMessage so Streamlit can update session_state.
-    """
-    lang       = st.session_state.lang
-    naive_txt  = st.session_state.naive_text
-    guided_txt = st.session_state.guided_text
-    show_cmp   = st.session_state.show_comparison
+        if st.session_state.stage1_saved:
+            st.success(t("s1_saved"))
+        else:
+            st.warning(t("s1_missing"))
 
-    naive_check  = run_check(naive_txt)  if naive_txt.strip()  else None
-    guided_check = run_check(guided_txt) if guided_txt.strip() else None
-    both         = bool(naive_txt.strip() and guided_txt.strip())
+        if st.session_state.stage2_saved:
+            st.success(t("s2_saved"))
+        else:
+            st.warning(t("s2_missing"))
 
-    # Stage headers
-    def stage_card(badge, title):
-        return (f'<div class="stage-card">'
-                f'<div class="stage-header">'
-                f'<span class="stage-badge">{badge}</span>'
-                f'<span class="stage-title">{title}</span>'
-                f'</div></div>')
+        # Progress bar  (0–5 steps)
+        progress = 0
+        if all_files_uploaded():
+            progress += 1
+        if st.session_state.stage1_saved:
+            progress += 1
+        if st.session_state.stage2_saved:
+            progress += 1
+        if st.session_state.comparison_notes:
+            progress += 1
+        if st.session_state.reflection_submitted:
+            progress += 1
+        st.progress(progress / 5, text=f"{progress}/5 complete")
 
-    naive_check_html  = build_check_html(naive_check)  if naive_check  else ""
-    guided_check_html = build_check_html(guided_check) if guided_check else ""
-    comparison_html   = build_comparison_html(naive_check, guided_check) if (show_cmp and both) else ""
-    s3_info_html      = "" if both else f'<div class="info-box">{S("s3_info")}</div>'
 
-    run_disabled  = "" if both else "disabled"
-    run_btn_style = "" if both else "opacity:.45;cursor:not-allowed;"
+# ──────────────────────────────────────────────
+# 8. PAGE 0 — WORKSHOP OVERVIEW
+# ──────────────────────────────────────────────
 
-    # Escape current values for embedding in JS
-    naive_val  = json.dumps(naive_txt)
-    guided_val = json.dumps(guided_txt)
+def page_overview() -> None:
+    lang = st.session_state.lang
 
-    # Goals list
-    goals_html = "".join(f"<li>{g}</li>" for g in S("goals"))
-    # How steps
-    steps_html = "".join(f"<li>{s}</li>" for s in S("how_steps"))
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <h2 style="margin:0; color:white;">{t("p0_title")}</h2>
+            <p style="margin-top:0.4rem; opacity:0.9;">{t("p0_caption")}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Sidebar prompts
-    np_escaped = S("naive_prompt").replace("\n","\\n").replace("`","\\`")
-    gp_escaped = S("guided_prompt").replace("\n","\\n").replace("`","\\`")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(t("p0_students"), "30")
+    c2.metric(t("p0_constraints"), "8")
+    c3.metric(t("p0_stages"), "2 + Compare")
 
-    return f"""<!DOCTYPE html>
-<html lang="{lang}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&family=DM+Serif+Display&family=Noto+Sans+TC:wght@300;400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap');
-  *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-  :root{{
-    --green:#2E7D32;--green-l:#43A047;--green-d:#1B5E20;
-    --accent:#FF8F00;--bg:#F7F9F7;--card:#fff;
-    --border:#C8E6C9;--text:#1A2E1B;--muted:#5C7A5D;
-    --fail:#C62828;
-  }}
-  body{{font-family:'DM Sans','Noto Sans TC',sans-serif;background:var(--bg);color:var(--text);font-size:15px;line-height:1.6}}
+    st.subheader(t("p0_how"))
+    for step in t("p0_steps"):
+        st.markdown(f"- {step}")
 
-  /* ── Layout ── */
-  .app-shell{{display:flex;min-height:100vh}}
-  .sidebar{{width:300px;min-width:300px;background:var(--green-d);padding:1.2rem 1rem;display:flex;flex-direction:column;gap:.6rem}}
-  .main{{flex:1;padding:1.4rem 1.8rem;overflow-x:hidden}}
+    with st.expander(t("p0_facilitator")):
+        st.markdown(t("p0_facilitator_body"))
 
-  /* ── Sidebar ── */
-  .sidebar,.sidebar *{{color:#E8F5E9}}
-  .sidebar h2{{font-size:1rem;font-weight:600;margin:.4rem 0 .2rem}}
-  .sidebar p{{font-size:.8rem;opacity:.85;margin:.2rem 0 .5rem}}
-  .sidebar hr{{border:none;border-top:1px solid rgba(255,255,255,.2);margin:.5rem 0}}
-  .sb-section{{background:rgba(255,255,255,.09);border-radius:9px;padding:.8rem .9rem;margin-bottom:.4rem}}
-  .sb-section h3{{font-size:.88rem;font-weight:600;margin-bottom:.25rem}}
-  .sb-section p{{font-size:.78rem;margin-bottom:.5rem}}
-  .sb-btn{{width:100%;background:rgba(255,255,255,.13);color:#E8F5E9;border:1px solid rgba(255,255,255,.28);
-    border-radius:7px;padding:.4rem .7rem;font-size:.8rem;cursor:pointer;text-align:left}}
-  .sb-btn:hover{{background:rgba(255,255,255,.22)}}
-  .lang-btn{{width:100%;background:rgba(255,255,255,.13);color:#fff;border:1px solid rgba(255,255,255,.3);
-    border-radius:7px;padding:.35rem .7rem;font-size:.82rem;cursor:pointer;margin-bottom:.5rem}}
-  .lang-btn:hover{{background:rgba(255,255,255,.22)}}
-  .collapsible-head{{cursor:pointer;font-size:.82rem;font-weight:500;padding:.3rem 0;display:flex;align-items:center;gap:.4rem}}
-  .collapsible-head::before{{content:"▶";font-size:.7rem;transition:.2s}}
-  .collapsible-head.open::before{{content:"▼"}}
-  .collapsible-body{{display:none;background:rgba(0,0,0,.25);border-radius:6px;
-    padding:.6rem .7rem;font-size:.76rem;white-space:pre-wrap;margin-top:.3rem;line-height:1.6}}
-  .collapsible-body.open{{display:block}}
-  .goals-list{{font-size:.8rem;padding-left:1.1rem;margin:.4rem 0}}
-  .goals-list li{{margin-bottom:.25rem;opacity:.9}}
+    st.markdown("")
+    if st.button(t("p0_cta"), key="go_step_1", type="primary"):
+        st.session_state.nav_step = 1
+        st.rerun()
 
-  /* ── Hero ── */
-  .hero{{background:linear-gradient(135deg,var(--green-d) 0%,var(--green) 55%,var(--green-l) 100%);
-    border-radius:14px;padding:2rem 2.2rem 1.6rem;margin-bottom:1.5rem;position:relative;overflow:hidden}}
-  .hero::after{{content:"🏫";position:absolute;right:2rem;top:50%;transform:translateY(-50%);font-size:4.5rem;opacity:.17}}
-  .hero h1{{font-family:'DM Serif Display','Noto Serif TC',serif;font-size:1.8rem;color:#fff;margin-bottom:.3rem;line-height:1.3}}
-  .hero p{{color:#C8E6C9;font-size:.9rem}}
 
-  /* ── Metrics ── */
-  .metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.2rem}}
-  .metric-card{{background:var(--card);border:1.5px solid var(--border);border-radius:10px;
-    padding:.9rem 1.1rem;text-align:center}}
-  .metric-val{{font-family:'DM Serif Display','Noto Serif TC',serif;font-size:2rem;color:var(--green);font-weight:700}}
-  .metric-lbl{{font-size:.8rem;color:var(--muted)}}
+# ──────────────────────────────────────────────
+# 9. PAGE 1 — UPLOAD WORKSHOP FILES
+# ──────────────────────────────────────────────
 
-  /* ── How it works ── */
-  .how-box{{background:var(--card);border:1.5px solid var(--border);border-radius:10px;
-    padding:1rem 1.2rem;margin-bottom:1.2rem}}
-  .how-box h4{{color:var(--green-d);margin-bottom:.5rem;font-size:.9rem}}
-  .how-box ol{{padding-left:1.2rem;font-size:.86rem;color:var(--muted)}}
-  .how-box li{{margin-bottom:.25rem}}
+def page_upload() -> None:
+    st.subheader(t("p1_title"))
 
-  /* ── Stage cards ── */
-  .stage-card{{background:var(--card);border:1.5px solid var(--border);border-radius:12px;
-    padding:1.3rem 1.6rem;margin-bottom:1rem;box-shadow:0 2px 7px rgba(46,125,50,.06)}}
-  .stage-header{{display:flex;align-items:center;gap:.65rem}}
-  .stage-badge{{background:var(--green);color:#fff;font-size:.68rem;font-weight:600;
-    letter-spacing:.08em;text-transform:uppercase;padding:.22rem .6rem;border-radius:20px}}
-  .stage-title{{font-family:'DM Serif Display','Noto Serif TC',serif;font-size:1.2rem;color:var(--green-d)}}
-  .think-aloud{{background:linear-gradient(90deg,#FFF8E1,#FFFDE7);border-left:4px solid var(--accent);
-    border-radius:0 8px 8px 0;padding:.75rem 1rem;margin:1rem 0;font-size:.86rem;color:#4E342E;line-height:1.7}}
-  .divider{{text-align:center;color:var(--muted);font-size:.78rem;letter-spacing:.1em;padding:.5rem 0 .9rem}}
-  .divider::before,.divider::after{{content:"";display:inline-block;width:55px;height:1px;
-    background:var(--border);vertical-align:middle;margin:0 .65rem}}
+    # ── Upload cards ──────────────────────────
+    col_cl, col_ct, col_tp = st.columns(3)
 
-  /* ── Textarea ── */
-  .ta-label{{font-size:.86rem;font-weight:500;margin-bottom:.35rem;color:var(--text)}}
-  textarea{{width:100%;height:180px;border:1.5px solid var(--border);border-radius:8px;
-    padding:.6rem .75rem;font-family:'DM Sans','Noto Sans TC',monospace;font-size:.84rem;
-    color:var(--text);resize:vertical;outline:none;background:#fff;line-height:1.6}}
-  textarea:focus{{border-color:var(--green-l);background:#FAFFFE}}
+    with col_cl:
+        with st.container(border=True):
+            st.subheader(t("p1_classlist"))
+            up_cl = st.file_uploader(
+                t("p1_classlist_up"),
+                type=["xlsx", "csv", "pdf"],
+                key="upload_classlist",
+            )
+            if up_cl:
+                store_uploaded_file(up_cl, "class_list")
+                st.success(t("p1_meta").format(
+                    name=up_cl.name, size=round(len(up_cl.getvalue()) / 1024, 1)
+                ))
 
-  /* ── Buttons ── */
-  .btn{{background:var(--green);color:#fff;border:none;border-radius:8px;
-    padding:.42rem 1.1rem;font-size:.88rem;font-weight:500;cursor:pointer}}
-  .btn:hover{{background:var(--green-d)}}
-  .btn-row{{display:flex;gap:.7rem;margin:.6rem 0}}
-  .btn-ghost{{background:transparent;color:var(--green);border:1.5px solid var(--green);
-    border-radius:8px;padding:.4rem 1rem;font-size:.88rem;cursor:pointer}}
-  .btn-ghost:hover{{background:#E8F5E9}}
+    with col_ct:
+        with st.container(border=True):
+            st.subheader(t("p1_constraints_lbl"))
+            up_ct = st.file_uploader(
+                t("p1_constraints_up"),
+                type=["pdf", "docx", "txt"],
+                key="upload_constraints",
+            )
+            if up_ct:
+                store_uploaded_file(up_ct, "constraint_ledger")
+                st.success(t("p1_meta").format(
+                    name=up_ct.name, size=round(len(up_ct.getvalue()) / 1024, 1)
+                ))
 
-  /* ── Badges ── */
-  .badge-grid{{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.7rem}}
-  .badge{{display:inline-flex;align-items:center;gap:.3rem;padding:.25rem .65rem;
-    border-radius:20px;font-size:.78rem;font-weight:500}}
-  .badge.pass{{background:#E8F5E9;color:var(--green);border:1px solid #A5D6A7}}
-  .badge.fail{{background:#FFEBEE;color:var(--fail);border:1px solid #EF9A9A}}
-  .score-wrap{{margin:.5rem 0 .25rem}}
-  .score-label{{font-size:.78rem;color:var(--muted);margin-bottom:.22rem}}
-  .score-bg{{background:#E8F5E9;border-radius:6px;height:9px;overflow:hidden}}
-  .score-fill{{height:9px;border-radius:6px;background:linear-gradient(90deg,var(--green-l),var(--green-d))}}
+    with col_tp:
+        with st.container(border=True):
+            st.subheader(t("p1_template"))
+            up_tp = st.file_uploader(
+                t("p1_template_up"),
+                type=["xlsx", "docx", "pdf"],
+                key="upload_template",
+            )
+            if up_tp:
+                store_uploaded_file(up_tp, "template")
+                st.success(t("p1_meta").format(
+                    name=up_tp.name, size=round(len(up_tp.getvalue()) / 1024, 1)
+                ))
 
-  /* ── Comparison ── */
-  .dash-banner{{background:linear-gradient(90deg,#E8F5E9,#F1F8E9);border-radius:9px;
-    padding:.85rem 1.2rem;margin-bottom:1rem;border:1px solid #A5D6A7;
-    display:flex;align-items:center;gap:1.2rem;font-size:.9rem}}
-  .cmp-grid{{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:.5rem}}
-  .cmp-col{{background:var(--card);border:1.5px solid var(--border);border-radius:11px;padding:1.2rem}}
-  .cmp-col h4{{font-family:'DM Serif Display','Noto Serif TC',serif;font-size:1rem;margin-bottom:.6rem}}
-  .naive-col{{border-top:4px solid #EF5350}}
-  .guided-col{{border-top:4px solid var(--green)}}
-  .big-score{{font-family:'DM Serif Display','Noto Serif TC',serif;font-size:2rem;font-weight:700}}
-  .cov-label{{font-size:.78rem;color:#888;margin-bottom:.7rem}}
-  .preview-label{{font-size:.8rem;font-weight:600;margin:.6rem 0 .3rem;color:var(--green-d)}}
-  .preview-box{{background:#F7F9F7;border:1px solid var(--border);border-radius:7px;
-    padding:.55rem .7rem;font-size:.78rem;white-space:pre-wrap;max-height:160px;
-    overflow-y:auto;color:#333;line-height:1.55;margin-bottom:.4rem}}
-  .analysis-row{{font-size:.8rem;padding:.18rem 0;border-bottom:1px solid #F0F4F0}}
-  .breakdown-table{{width:100%;border-collapse:collapse;font-size:.82rem}}
-  .breakdown-table th{{background:#E8F5E9;color:var(--green-d);padding:.4rem .6rem;text-align:left;border-bottom:2px solid var(--border)}}
-  .breakdown-table td{{padding:.35rem .6rem;border-bottom:1px solid #F0F4F0}}
-  .breakdown-table tr:hover td{{background:#F7FFF7}}
-  .info-box{{background:#E3F2FD;border:1px solid #90CAF9;border-radius:8px;
-    padding:.6rem 1rem;font-size:.84rem;color:#0D47A1;margin:.5rem 0}}
-</style>
-</head>
-<body>
-<div class="app-shell">
+    # ── Preview ──────────────────────────────
+    st.divider()
+    st.subheader(t("p1_preview"))
 
-<!-- ═══ SIDEBAR ═══ -->
-<div class="sidebar">
-  <button class="lang-btn" onclick="send('lang')">{ S("lang_btn") }</button>
+    wf = st.session_state.workshop_files
+    tab_cl, tab_ct, tab_tp = st.tabs(
+        [t("p1_classlist"), t("p1_constraints_lbl"), t("p1_template")]
+    )
 
-  <h2>{ S("res_hub") }</h2>
-  <p>{ S("res_sub") }</p>
+    with tab_cl:
+        _preview_file(wf["class_list"], tabular_types=["xlsx", "csv"])
 
-  <div class="sb-section">
-    <h3>{ S("cl_title") }</h3>
-    <p>{ S("cl_desc") }</p>
-    <button class="sb-btn" onclick="send('dl_xlsx')">{ S("cl_btn") }</button>
-  </div>
+    with tab_ct:
+        _preview_file(wf["constraint_ledger"], tabular_types=[])
 
-  <div class="sb-section">
-    <h3>{ S("pdf_title") }</h3>
-    <p>{ S("pdf_desc") }</p>
-    <button class="sb-btn" onclick="send('dl_pdf')">{ S("pdf_btn") }</button>
-  </div>
+    with tab_tp:
+        _preview_file(wf["template"], tabular_types=["xlsx"])
 
-  <hr>
-  <h2>{ S("prompt_ref") }</h2>
-  <div class="sb-section">
-    <div class="collapsible-head" onclick="toggle(this)">{ S("s1_prompt_lbl") }</div>
-    <div class="collapsible-body">{ S("naive_prompt") }</div>
-    <div class="collapsible-head" onclick="toggle(this)" style="margin-top:.5rem">{ S("s2_prompt_lbl") }</div>
-    <div class="collapsible-body">{ S("guided_prompt") }</div>
-  </div>
+    # ── Download buttons ──────────────────────
+    st.divider()
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
 
-  <hr>
-  <h2>{ S("goals_title") }</h2>
-  <ul class="goals-list">{goals_html}</ul>
-</div>
+    for col, slot_key, label in [
+        (dl_col1, "class_list", t("p1_classlist")),
+        (dl_col2, "constraint_ledger", t("p1_constraints_lbl")),
+        (dl_col3, "template", t("p1_template")),
+    ]:
+        fd = wf[slot_key]
+        with col:
+            if fd:
+                st.download_button(
+                    f"{t('p1_download')} {label}",
+                    data=fd["bytes"],
+                    file_name=fd["filename"],
+                    mime=fd["mime"],
+                    key=f"dl_{slot_key}",
+                )
+            else:
+                st.button(f"{t('p1_download')} {label}", disabled=True, key=f"dl_{slot_key}_dis")
 
-<!-- ═══ MAIN ═══ -->
-<div class="main">
+    # ── Completion indicator + CTA ────────────
+    st.divider()
+    if all_files_uploaded():
+        st.success(t("p1_all_ok"))
+        if st.button(t("p1_continue"), key="btn_to_stage1", type="primary"):
+            st.session_state.nav_step = 2
+            st.rerun()
+    else:
+        st.warning(t("p1_missing"))
 
-  <!-- Hero -->
-  <div class="hero">
-    <h1>{ S("page_title") }</h1>
-    <p>{ S("page_subtitle") }</p>
-  </div>
 
-  <!-- Metrics -->
-  <div class="metrics">
-    <div class="metric-card"><div class="metric-val">30</div><div class="metric-lbl">{ S("m_students") }</div></div>
-    <div class="metric-card"><div class="metric-val">8</div><div class="metric-lbl">{ S("m_constraints") }</div></div>
-    <div class="metric-card"><div class="metric-val">3</div><div class="metric-lbl">{ S("m_stages") }</div></div>
-  </div>
+def _preview_file(fd: dict | None, tabular_types: list[str]) -> None:
+    """Render a preview for a stored file dict."""
+    if fd is None:
+        st.info("No file uploaded yet.")
+        return
 
-  <!-- How it works -->
-  <div class="how-box">
-    <h4>{ S("how_title") }</h4>
-    <ol>{steps_html}</ol>
-  </div>
+    ext = fd["filename"].rsplit(".", 1)[-1].lower()
+    size_kb = round(len(fd["bytes"]) / 1024, 1)
+    st.info(f"📄 **{fd['filename']}** — {size_kb} KB")
 
-  <!-- ── Stage 1 ── -->
-  <div class="stage-card">
-    <div class="stage-header">
-      <span class="stage-badge">{ S("s1_badge") }</span>
-      <span class="stage-title">{ S("s1_title") }</span>
-    </div>
-  </div>
-  <div class="think-aloud">{ S("s1_think") }</div>
-  <div class="ta-label">{ S("s1_label") }</div>
-  <textarea id="naive_ta" placeholder="{ S('s1_ph') }" oninput="autoSave('naive')">{naive_txt}</textarea>
-  <div id="naive_check">{naive_check_html}</div>
-  <div class="divider">{ S("s1_div") }</div>
+    if ext in tabular_types:
+        try:
+            raw = io.BytesIO(fd["bytes"])
+            df = pd.read_excel(raw) if ext == "xlsx" else pd.read_csv(raw)
+            st.dataframe(df.head(15), use_container_width=True)
+        except Exception as exc:
+            st.warning(f"Could not parse as table: {exc}")
+    elif ext == "txt":
+        try:
+            text = fd["bytes"].decode("utf-8", errors="replace")
+            st.text(text[:2000])
+        except Exception:
+            pass
 
-  <!-- ── Stage 2 ── -->
-  <div class="stage-card">
-    <div class="stage-header">
-      <span class="stage-badge">{ S("s2_badge") }</span>
-      <span class="stage-title">{ S("s2_title") }</span>
-    </div>
-  </div>
-  <div class="think-aloud">{ S("s2_think") }</div>
-  <div class="ta-label">{ S("s2_label") }</div>
-  <textarea id="guided_ta" placeholder="{ S('s2_ph') }" oninput="autoSave('guided')">{guided_txt}</textarea>
-  <div id="guided_check">{guided_check_html}</div>
-  <div class="divider">{ S("s2_div") }</div>
 
-  <!-- ── Stage 3 ── -->
-  <div class="stage-card">
-    <div class="stage-header">
-      <span class="stage-badge">{ S("s3_badge") }</span>
-      <span class="stage-title">{ S("s3_title") }</span>
-    </div>
-  </div>
-  <div class="think-aloud">{ S("s3_think") }</div>
-  <div class="btn-row">
-    <button class="btn" id="run_btn" style="{run_btn_style}" {run_disabled}
-      onclick="send('run')">{ S("s3_run") }</button>
-    <button class="btn-ghost" onclick="send('reset')">{ S("s3_reset") }</button>
-  </div>
-  {s3_info_html}
+# ──────────────────────────────────────────────
+# 10. STAGE SUBMISSION (shared logic for p2 & p3)
+# ──────────────────────────────────────────────
 
-  <!-- ── Comparison (rendered server-side) ── -->
-  <div id="comparison">{comparison_html}</div>
+def page_stage(stage: int) -> None:
+    lang = st.session_state.lang
+    assert stage in (1, 2)
 
-  <hr style="border:none;border-top:1px solid #C8E6C9;margin:1.5rem 0">
-  <p style="text-align:center;font-size:.75rem;color:#aaa">{ S("footer") }</p>
-</div><!-- /main -->
-</div><!-- /app-shell -->
+    if stage == 1:
+        title = t("p2_title")
+        caption = t("p2_caption")
+        prompt_text = NAIVE_PROMPT[lang]
+        tab_paste_label = t("p2_tab_paste")
+        tab_upload_label = t("p2_tab_upload")
+        paste_label = t("p2_paste_label")
+        upload_label = t("p2_upload_label")
+        preview_header = t("p2_preview")
+        save_btn = t("p2_save")
+        saved_ok = t("p2_saved_ok")
+        download_label = t("p2_download_sub")
+        text_key = "stage1_text"
+        file_key = "stage1_file"
+        saved_key = "stage1_saved"
+    else:
+        title = t("p3_title")
+        caption = t("p3_caption")
+        prompt_text = GUIDED_PROMPT[lang]
+        tab_paste_label = t("p2_tab_paste")
+        tab_upload_label = t("p2_tab_upload")
+        paste_label = t("p3_paste_label")
+        upload_label = t("p3_upload_label")
+        preview_header = t("p3_preview")
+        save_btn = t("p3_save")
+        saved_ok = t("p3_saved_ok")
+        download_label = t("p3_download_sub")
+        text_key = "stage2_text"
+        file_key = "stage2_file"
+        saved_key = "stage2_saved"
 
-<script>
-  // ── postMessage bridge to Streamlit ──────────────────────────────────────
-  // Debounce timer for textarea auto-save
-  let saveTimer = null;
+    # Header
+    st.markdown(f'<span class="stage-pill">Stage {stage}</span>', unsafe_allow_html=True)
+    st.subheader(title)
+    st.caption(caption)
 
-  function send(action, payload) {{
-    const msg = {{
-      isStreamlitMessage: true,
-      type: "streamlit:setComponentValue",
-      value: {{ action: action, payload: payload || null }}
-    }};
-    window.parent.postMessage(msg, "*");
-  }}
+    # Prompt display card
+    with st.container(border=True):
+        st.markdown(f"**{t('p2_prompt_label') if stage == 1 else t('p2_prompt_label')}**")
+        st.code(prompt_text, language="markdown")
 
-  function autoSave(which) {{
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {{
-      const val = document.getElementById(which + '_ta').value;
-      send('save_' + which, val);
-    }}, 600);   // 600 ms debounce
-  }}
+    st.divider()
 
-  function toggle(head) {{
-    head.classList.toggle('open');
-    const body = head.nextElementSibling;
-    body.classList.toggle('open');
-  }}
+    # Submission tabs
+    tab_paste, tab_upload = st.tabs([tab_paste_label, tab_upload_label])
 
-  // Restore scroll position after rerun (Streamlit resets iframe scroll)
-  if (window.self !== window.top) {{
-    window.scrollTo(0, 0);
-  }}
+    with tab_paste:
+        user_text = st.text_area(
+            paste_label,
+            value=st.session_state[text_key],
+            height=260,
+            key=f"_ta_stage{stage}",
+        )
+        # Sync back without triggering rerun on every keystroke
+        st.session_state[text_key] = user_text
 
-  // notify Streamlit iframe is ready
-  window.parent.postMessage(
-    {{ isStreamlitMessage: true, type: "streamlit:componentReady" }},
-    "*"
-  );
+    with tab_upload:
+        up_doc = st.file_uploader(
+            upload_label,
+            type=["pdf", "docx", "xlsx", "txt"],
+            key=f"_up_stage{stage}",
+        )
+        if up_doc:
+            st.session_state[file_key] = {
+                "filename": up_doc.name,
+                "bytes": up_doc.getvalue(),
+                "mime": up_doc.type,
+            }
+            st.success(f"📎 {up_doc.name}")
 
-  // set iframe height
-  window.parent.postMessage(
-    {{ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: document.body.scrollHeight }},
-    "*"
-  );
-</script>
-</body>
-</html>"""
+    # Preview
+    st.subheader(preview_header)
+    text_val = st.session_state[text_key]
+    file_val = st.session_state[file_key]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. STREAMLIT ENTRY POINT
-#    One components.html() call renders everything.
-#    The return value carries the postMessage payload.
-# ══════════════════════════════════════════════════════════════════════════════
+    if text_val:
+        with st.expander("Text preview", expanded=True):
+            st.markdown(text_val[:4000])
 
-# Compute approximate height (enough for all content)
+    if file_val:
+        st.download_button(
+            download_label,
+            data=file_val["bytes"],
+            file_name=file_val["filename"],
+            mime=file_val["mime"],
+            key=f"dl_stage{stage}_file",
+        )
 
-def main():
-  PANEL_HEIGHT = 3600
+    if not text_val and not file_val:
+        st.info("No submission yet.")
 
-  result = components.html(
-      build_full_html(),
-      height=PANEL_HEIGHT,
-      scrolling=True,
-  )
+    # Save button
+    st.divider()
+    col_save, col_status = st.columns([2, 5])
+    with col_save:
+        if st.button(save_btn, key=f"save_stage{stage}", type="primary"):
+            st.session_state[saved_key] = True
+            st.session_state[f"stage{stage}_saved_ts"] = datetime.datetime.now().strftime(
+                "%Y-%m-%d %H:%M"
+            )
+    with col_status:
+        if st.session_state[saved_key]:
+            ts = st.session_state.get(f"stage{stage}_saved_ts", "")
+            st.success(f"✅ {saved_ok}" + (f"  _{ts}_" if ts else ""))
 
-  # ── Handle postMessage events ────────────────────────────────────────────────
-  action = ""
-  payload = None
+    # Navigation shortcut
+    if st.session_state[saved_key]:
+        next_step = stage + 1 if stage < 5 else 5
+        if st.button(
+            f"Continue to Step {next_step} →",
+            key=f"continue_stage{stage}",
+        ):
+            st.session_state.nav_step = next_step
+            st.rerun()
 
-  if isinstance(result, dict):
-      action = result.get("action", "")
-      payload = result.get("payload")
 
-      if action == "lang":
-          st.session_state.lang = "en" if st.session_state.lang == "zh" else "zh"
-          st.rerun()
+# ──────────────────────────────────────────────
+# 11. PAGE 4 — COMPARE OUTPUTS
+# ──────────────────────────────────────────────
 
-      elif action == "save_naive":
-          if payload is not None and payload != st.session_state.naive_text:
-              st.session_state.naive_text = str(payload)
-              # Don't rerun on every keystroke — let debounce batch it.
-              # Only rerun when a constraint keyword crosses a threshold:
-              new_check = run_check(st.session_state.naive_text)
-              if st.session_state.get("_naive_score") != new_check["score"]:
-                  st.session_state["_naive_score"] = new_check["score"]
-                  st.rerun()
+def page_compare() -> None:
+    # Gate
+    if not st.session_state.stage1_saved or not st.session_state.stage2_saved:
+        st.warning(t("p4_gate_warn"))
+        st.stop()
 
-      elif action == "save_guided":
-          if payload is not None and payload != st.session_state.guided_text:
-              st.session_state.guided_text = str(payload)
-              new_check = run_check(st.session_state.guided_text)
-              if st.session_state.get("_guided_score") != new_check["score"]:
-                  st.session_state["_guided_score"] = new_check["score"]
-                  st.rerun()
+    st.subheader(t("p4_title"))
+    st.caption(t("p4_caption"))
 
-      elif action == "run":
-          st.session_state.show_comparison = True
-          st.rerun()
+    # Side-by-side text
+    col_l, col_r = st.columns(2)
 
-      elif action == "reset":
-          for k in ["naive_text","guided_text","show_comparison",
-                    "_naive_score","_guided_score"]:
-              st.session_state.pop(k, None)
-          st.session_state.show_comparison = False
-          st.rerun()
+    with col_l:
+        st.markdown(t("p4_s1_header"))
+        with st.container(border=True):
+            text1 = st.session_state.stage1_text
+            if text1:
+                st.markdown(text1[:4000])
+            else:
+                st.markdown(t("p4_s1_empty"))
+        fd1 = st.session_state.stage1_file
+        if fd1:
+            st.download_button(
+                "⬇ Stage 1 File",
+                data=fd1["bytes"],
+                file_name=fd1["filename"],
+                mime=fd1["mime"],
+                key="compare_dl_s1",
+            )
 
-      elif action == "dl_xlsx":
-          # File downloads can't happen from inside an iframe — show a native
-          # Streamlit download button at the very bottom of the page instead.
-          st.session_state["_pending_dl"] = "xlsx"
-          st.rerun()
+    with col_r:
+        st.markdown(t("p4_s2_header"))
+        with st.container(border=True):
+            text2 = st.session_state.stage2_text
+            if text2:
+                st.markdown(text2[:4000])
+            else:
+                st.markdown(t("p4_s2_empty"))
+        fd2 = st.session_state.stage2_file
+        if fd2:
+            st.download_button(
+                "⬇ Stage 2 File",
+                data=fd2["bytes"],
+                file_name=fd2["filename"],
+                mime=fd2["mime"],
+                key="compare_dl_s2",
+            )
 
-      elif action == "dl_pdf":
-          st.session_state["_pending_dl"] = "pdf"
-          st.rerun()
+    st.divider()
 
-  # ── Fallback download buttons (rendered outside iframe so they work) ─────────
-  pending = st.session_state.pop("_pending_dl", None)
-  if pending == "xlsx":
-      st.download_button(
-          "⬇ Click to download Class_List.xlsx",
-          data=gen_xlsx(),
-          file_name="Class_List.xlsx",
-          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          key="_dl_xlsx_btn",
-      )
-  elif pending == "pdf":
-      st.download_button(
-          "⬇ Click to download Constraint_Ledger.pdf",
-          data=gen_pdf(),
-          file_name="Constraint_Ledger.pdf",
-          mime="application/pdf",
-          key="_dl_pdf_btn",
-      )
+    # Facilitator notes
+    notes = st.text_area(
+        t("p4_notes_label"),
+        value=st.session_state.comparison_notes,
+        height=150,
+        key="_compare_notes_ta",
+    )
+    st.session_state.comparison_notes = notes
+
+    st.divider()
+
+    # Constraint checklist
+    st.subheader(t("p4_checklist_header"))
+    st.info(t("p4_checklist_tip"))
+
+    # Build or reuse existing df
+    if st.session_state.constraint_checklist is None:
+        df_check = build_constraint_df()
+    else:
+        df_check = pd.DataFrame(st.session_state.constraint_checklist)
+        # Re-label columns if language changed
+        expected_cols = [
+            t("p4_col_constraint"), t("p4_col_s1"), t("p4_col_s2"), t("p4_col_notes")
+        ]
+        if list(df_check.columns) != expected_cols:
+            df_check = build_constraint_df()
+
+    edited_df = st.data_editor(
+        df_check,
+        num_rows="fixed",
+        use_container_width=True,
+        key="_constraint_editor",
+        column_config={
+            t("p4_col_s1"): st.column_config.CheckboxColumn(t("p4_col_s1")),
+            t("p4_col_s2"): st.column_config.CheckboxColumn(t("p4_col_s2")),
+        },
+    )
+    # Persist
+    st.session_state.constraint_checklist = edited_df.to_dict(orient="records")
+
+    # Action buttons row
+    st.divider()
+    btn_c1, btn_c2, btn_c3, _ = st.columns([2, 2, 2, 4])
+
+    with btn_c1:
+        if st.button(t("p4_reset_compare"), key="reset_compare"):
+            st.session_state.comparison_notes = ""
+            st.session_state.constraint_checklist = None
+            st.rerun()
+
+    with btn_c2:
+        if st.button(t("p4_soft_reset"), key="btn_soft_reset"):
+            soft_reset()
+            st.session_state.nav_step = 2
+            st.rerun()
+
+    with btn_c3:
+        if st.button(t("p4_reset_all"), key="reset_all", type="secondary"):
+            hard_reset()
+            st.session_state.nav_step = 0
+            st.rerun()
+
+    # CSV download
+    csv_bytes = edited_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        t("p4_download_csv"),
+        data=csv_bytes,
+        file_name="constraint_checklist.csv",
+        mime="text/csv",
+        key="dl_checklist_csv",
+    )
+
+    # Navigation
+    if st.button("Continue to Reflection →", key="continue_compare"):
+        st.session_state.nav_step = 5
+        st.rerun()
+
+
+# ──────────────────────────────────────────────
+# 12. PAGE 5 — REFLECTION + EXIT TICKET
+# ──────────────────────────────────────────────
+
+def page_reflection() -> None:
+    st.subheader(t("p5_title"))
+
+    if not st.session_state.reflection_submitted:
+        with st.form("reflection_form"):
+            q1 = st.text_area(t("p5_q1"), value=st.session_state.ref_q1, key="ref_q1_f")
+            q2 = st.text_area(t("p5_q2"), value=st.session_state.ref_q2, key="ref_q2_f")
+            q3 = st.text_area(t("p5_q3"), value=st.session_state.ref_q3, key="ref_q3_f")
+            rating = st.slider(
+                t("p5_rating"), 1, 5,
+                value=st.session_state.ref_rating,
+                key="ref_rating_f",
+            )
+            name = st.text_input(t("p5_name"), value=st.session_state.ref_name, key="ref_name_f")
+            school = st.text_input(t("p5_school"), value=st.session_state.ref_school, key="ref_school_f")
+
+            submitted = st.form_submit_button(t("p5_submit"), type="primary")
+
+        if submitted:
+            st.session_state.ref_q1 = q1
+            st.session_state.ref_q2 = q2
+            st.session_state.ref_q3 = q3
+            st.session_state.ref_rating = rating
+            st.session_state.ref_name = name
+            st.session_state.ref_school = school
+            st.session_state.reflection_submitted = True
+            st.rerun()
+    else:
+        st.success(t("p5_thanks"))
+
+        # Summary display
+        with st.expander("View submitted reflection", expanded=True):
+            st.markdown(f"**{t('p5_q1')}**")
+            st.markdown(st.session_state.ref_q1 or "_—_")
+            st.markdown(f"**{t('p5_q2')}**")
+            st.markdown(st.session_state.ref_q2 or "_—_")
+            st.markdown(f"**{t('p5_q3')}**")
+            st.markdown(st.session_state.ref_q3 or "_—_")
+            st.markdown(f"**{t('p5_rating')}:** {st.session_state.ref_rating}/5")
+            if st.session_state.ref_name:
+                st.markdown(f"**{t('p5_name')}:** {st.session_state.ref_name}")
+            if st.session_state.ref_school:
+                st.markdown(f"**{t('p5_school')}:** {st.session_state.ref_school}")
+
+        # JSON export
+        summary_json = session_summary()
+        st.download_button(
+            t("p5_download_json"),
+            data=summary_json.encode("utf-8"),
+            file_name="workshop_session.json",
+            mime="application/json",
+            key="dl_session_json",
+        )
+
+        # Allow re-edit
+        if st.button("Edit reflection", key="re_edit_reflection"):
+            st.session_state.reflection_submitted = False
+            st.rerun()
+
+
+# ──────────────────────────────────────────────
+# 13. MAIN ROUTER
+# ──────────────────────────────────────────────
+
+def main() -> None:
+    init_session_state()
+    render_top_bar()
+    render_sidebar()
+
+    step = st.session_state.nav_step
+
+    if step == 0:
+        page_overview()
+    elif step == 1:
+        page_upload()
+    elif step == 2:
+        page_stage(1)
+    elif step == 3:
+        page_stage(2)
+    elif step == 4:
+        page_compare()
+    elif step == 5:
+        page_reflection()
+    else:
+        st.error("Unknown step.")
+
 
 if __name__ == "__main__":
     main()
